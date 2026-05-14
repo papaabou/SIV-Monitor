@@ -39,3 +39,5 @@ L’objectif est de montrer une approche simple de supervision, d’automatisati
 
 ```bash
 pip install -r requirements.txt
+```
+

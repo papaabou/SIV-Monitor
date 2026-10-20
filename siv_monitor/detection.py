@@ -72,8 +72,8 @@ class MLDetector:
     contamination: float = 0.03
     n_estimators: int = 300
     random_state: int = 0
-    quantile: float = 0.97
-    min_duration: int = 2
+    quantile: float = 0.95
+    min_duration: int = 3
 
     def fit(self, df: pd.DataFrame) -> "MLDetector":
         x = build_features(df)

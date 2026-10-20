@@ -1,100 +1,99 @@
-import csv
-import random
-from datetime import datetime
+"""
+Point d'entrée en ligne de commande.
 
-LOG_FILE = "logs_systeme.csv"
-REPORT_FILE = "rapport.txt"
+    python main.py              # génère les données, entraîne le modèle, écrit le rapport
+    python main.py --benchmark  # compare seuils fixes et ML sur 20 scénarios indépendants
+"""
+from __future__ import annotations
 
-# Configuration des seuils
-TEMP_THRESHOLD = 75
-TOTAL_TESTS = 50
+import argparse
+from pathlib import Path
 
+import pandas as pd
 
-def generate_data():
-    """
-    Génère une ligne de données simulant un test du système.
-    
-    Returns:
-        dict: Dictionnaire contenant les données du test avec clés:
-              - date, temperature, connexion, alimentation, ecran, gps, audio
-              - statut (OK ou ALERTE), anomalies
-    """
-    temperature = random.randint(35, 95)
-    connexion = random.choice(["OK", "OK", "OK", "PERDUE"])
-    alimentation = random.randint(20, 100)
-    ecran = random.choice(["OK", "OK", "OK", "ERREUR"])
-    gps = random.choice(["OK", "OK", "OK", "SIGNAL_FAIBLE"])
-    audio = random.choice(["OK", "OK", "ERREUR"])
+from siv_monitor import INCIDENT_TYPES, MLDetector, RuleDetector, SimulationConfig, evaluate, simulate
 
-    anomalies = []
-
-    if temperature > TEMP_THRESHOLD:
-        anomalies.append("Température élevée")
-    if connexion == "PERDUE":
-        anomalies.append("Connexion perdue")
-    if ecran == "ERREUR":
-        anomalies.append("Erreur écran voyageurs")
-    if gps == "SIGNAL_FAIBLE":
-        anomalies.append("Signal GPS faible")
-    if audio == "ERREUR":
-        anomalies.append("Erreur annonce sonore")
-
-    statut = "ALERTE" if anomalies else "OK"
-
-    return {
-        "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "temperature": temperature,
-        "connexion": connexion,
-        "alimentation": alimentation,
-        "ecran": ecran,
-        "gps": gps,
-        "audio": audio,
-        "statut": statut,
-        "anomalies": ", ".join(anomalies) if anomalies else "Aucune"
-    }
+OUTPUT_DIR = Path("output")
+LOG_FILE = OUTPUT_DIR / "logs_systeme.csv"
+REPORT_FILE = OUTPUT_DIR / "rapport.md"
 
 
-def main():
-    """
-    Génère les données de test, les enregistre dans un CSV
-    et crée un rapport de fiabilité en fichier texte.
-    """
-    total_alertes = 0
+def train_detector(seed: int = 1000) -> MLDetector:
+    """Entraîne l'Isolation Forest sur une semaine d'historique (sans utiliser les étiquettes)."""
+    history = simulate(SimulationConfig(n_minutes=7 * 24 * 60, seed=seed, incident_rate_per_day=2))
+    return MLDetector().fit(history)
 
-    try:
-        with open(LOG_FILE, "w", newline="", encoding="utf-8") as file:
-            writer = csv.DictWriter(file, fieldnames=[
-                "date", "temperature", "connexion", "alimentation",
-                "ecran", "gps", "audio", "statut", "anomalies"
-            ])
-            writer.writeheader()
 
-            for _ in range(TOTAL_TESTS):
-                data = generate_data()
-                writer.writerow(data)
+def run(seed: int = 7) -> tuple[pd.DataFrame, dict, dict]:
+    df = simulate(SimulationConfig(seed=seed))
+    rules, ml = RuleDetector(), train_detector()
+    df["alerte_seuils"] = rules.predict(df)
+    df["score_ml"] = ml.score(df).round(4)
+    df["alerte_ml"] = ml.predict(df)
+    return df, evaluate(df, df["alerte_seuils"].to_numpy()), evaluate(df, df["alerte_ml"].to_numpy())
 
-                if data["statut"] == "ALERTE":
-                    total_alertes += 1
 
-        taux_fiabilite = ((TOTAL_TESTS - total_alertes) / TOTAL_TESTS) * 100
+def benchmark(n_runs: int = 20) -> pd.DataFrame:
+    """Moyenne des performances sur `n_runs` scénarios jamais utilisés pendant la mise au point."""
+    rows = []
+    for i in range(n_runs):
+        test = simulate(SimulationConfig(seed=500 + i))
+        history = simulate(SimulationConfig(n_minutes=7 * 24 * 60, seed=900 + i, incident_rate_per_day=2))
+        ml = MLDetector().fit(history)
+        for name, pred in [("Seuils fixes", RuleDetector().predict(test)), ("Isolation Forest", ml.predict(test))]:
+            res = evaluate(test, pred)
+            rows.append({"methode": name, **{k: v for k, v in res.items() if k != "par_type"},
+                         **{f"type_{k}": v for k, v in res["par_type"].items()}})
+    return pd.DataFrame(rows).groupby("methode").mean(numeric_only=True)
 
-        with open(REPORT_FILE, "w", encoding="utf-8") as report:
-            report.write("Rapport de supervision - SIV Monitor\n")
-            report.write("====================================\n\n")
-            report.write(f"Nombre total de tests : {TOTAL_TESTS}\n")
-            report.write(f"Nombre total d'alertes : {total_alertes}\n")
-            report.write(f"Taux de bon fonctionnement : {taux_fiabilite:.2f}%\n")
 
-        print("Données générées avec succès.")
-        print(f"Fichier {LOG_FILE} créé.")
-        print(f"Fichier {REPORT_FILE} créé.")
-        
-    except IOError as e:
-        print(f"Erreur lors de l'écriture des fichiers : {e}")
-        raise
-    except Exception as e:
-        print(f"Erreur inattendue : {e}")
-        raise
+def write_report(rules: dict, ml: dict) -> str:
+    def pct(x: float) -> str:
+        return f"{100 * x:.0f} %"
+
+    lines = [
+        "# Rapport de supervision — SIV Monitor",
+        "",
+        f"Incidents simulés : **{rules['incidents']}** sur 3 jours de télémétrie.",
+        "",
+        "| Indicateur | Seuils fixes | Isolation Forest |",
+        "|---|---|---|",
+        f"| Incidents détectés | {rules['incidents_detectes']} ({pct(rules['taux_detection'])}) "
+        f"| {ml['incidents_detectes']} ({pct(ml['taux_detection'])}) |",
+        f"| Précision | {pct(rules['precision'])} | {pct(ml['precision'])} |",
+        f"| Rappel | {pct(rules['rappel'])} | {pct(ml['rappel'])} |",
+        f"| F1 | {rules['f1']:.2f} | {ml['f1']:.2f} |",
+        f"| Fausses alertes | {rules['fausses_alertes']} | {ml['fausses_alertes']} |",
+        "",
+        "## Détection par type d'incident",
+        "",
+        "| Type | Seuils fixes | Isolation Forest |",
+        "|---|---|---|",
+    ]
+    for kind, label in INCIDENT_TYPES.items():
+        if kind in rules["par_type"]:
+            lines.append(f"| {label} | {pct(rules['par_type'][kind])} | {pct(ml['par_type'][kind])} |")
+    return "\n".join(lines) + "\n"
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="SIV Monitor")
+    parser.add_argument("--benchmark", action="store_true", help="comparer les méthodes sur 20 scénarios")
+    parser.add_argument("--seed", type=int, default=7)
+    args = parser.parse_args()
+
+    if args.benchmark:
+        with pd.option_context("display.float_format", "{:.3f}".format, "display.width", 200):
+            print(benchmark().T)
+        return
+
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    df, rules, ml = run(args.seed)
+    df.to_csv(LOG_FILE, index=False)
+    report = write_report(rules, ml)
+    REPORT_FILE.write_text(report, encoding="utf-8")
+    print(report)
+    print(f"Logs : {LOG_FILE}  |  Rapport : {REPORT_FILE}")
 
 
 if __name__ == "__main__":

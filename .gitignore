@@ -1,42 +1,19 @@
-# Generated files
+# Fichiers générés
+output/
 logs_systeme.csv
 rapport.txt
 
 # Python
 __pycache__/
 *.py[cod]
-*$py.class
-*.so
-.Python
-env/
+.venv/
 venv/
-ENV/
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
+.pytest_cache/
 
-# IDE
+# IDE / outils
 .vscode/
 .idea/
-*.swp
-*.swo
-*~
-
-# OS
+.claude/
+.streamlit/
 .DS_Store
 Thumbs.db
-
-# Streamlit
-.streamlit/

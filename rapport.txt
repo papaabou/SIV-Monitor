@@ -1,6 +1,0 @@
-Rapport de supervision - SIV Monitor
-====================================
-
-Nombre total de tests : 50
-Nombre total d'alertes : 40
-Taux de bon fonctionnement : 20.00%

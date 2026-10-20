@@ -1,107 +1,114 @@
-import streamlit as st
+"""Dashboard Streamlit : `streamlit run app.py`"""
 import pandas as pd
-import matplotlib.pyplot as plt
-import os
-import subprocess
-# Configuration de la pagest.set_page_config(
-    page_title="SIV Monitor",
-    page_icon="�",
-    layout="wide"
-)
+import plotly.graph_objects as go
+import streamlit as st
 
-st.title("SIV Monitor")
-st.subheader("Dashboard de supervision d’un système d’information voyageurs embarqué")
+from siv_monitor import INCIDENT_TYPES, SENSORS, MLDetector, RuleDetector, SimulationConfig, evaluate, incidents, simulate
 
-st.markdown("""
-Ce projet simule la supervision d’un système embarqué ferroviaire :  
-température, connexion, alimentation, écran voyageurs, GPS et annonces sonores.
-""")
+st.set_page_config(page_title="SIV Monitor", page_icon="🚆", layout="wide")
 
-# Bouton pour générer de nouvelles données
-if st.button("Générer de nouvelles données"):
-    try:
-        subprocess.run(["python", "main.py"], check=True)
-        st.success("Nouvelles données générées avec succès.")
-    except subprocess.CalledProcessError:
-        st.error("Erreur lors de la génération des données.")
+SENSOR_LABELS = {
+    "temperature": "Température (°C)",
+    "cpu_load": "Charge CPU (%)",
+    "fan_rpm": "Ventilateur (tr/min)",
+    "voltage": "Alimentation (V)",
+    "latency_ms": "Latence réseau (ms)",
+    "gps_snr": "Signal GPS (dB)",
+}
 
-# Vérifier que le fichier de données existe
-if not os.path.exists("logs_systeme.csv"):
-    st.warning("Aucune donnée disponible. Clique sur le bouton pour générer les données.")
-    st.stop()
 
-# Charger les données
-try:
-    df = pd.read_csv("logs_systeme.csv")
-except Exception as e:
-    st.error(f"Erreur lors de la lecture des données : {e}")
-    st.stop()
+@st.cache_resource
+def trained_detector(seed: int) -> MLDetector:
+    history = simulate(SimulationConfig(n_minutes=7 * 24 * 60, seed=seed, incident_rate_per_day=2))
+    return MLDetector().fit(history)
 
-# Calcul des métriques
-total_tests = len(df)
-total_alertes = len(df[df["statut"] == "ALERTE"])
-total_ok = len(df[df["statut"] == "OK"])
-taux_fiabilite = (total_ok / total_tests) * 100 if total_tests > 0 else 0
 
-# Affichage des métriques dans des colonnes
-col1, col2, col3, col4 = st.columns(4)
+@st.cache_data
+def scenario(seed: int, days: int, rate: float) -> pd.DataFrame:
+    return simulate(SimulationConfig(n_minutes=days * 24 * 60, seed=seed, incident_rate_per_day=rate))
 
-col1.metric("Tests effectués", total_tests)
-col2.metric("Systèmes OK", total_ok)
-col3.metric("Alertes détectées", total_alertes)
-col4.metric("Fiabilité", f"{taux_fiabilite:.2f}%")
 
-st.divider()
+st.title("🚆 SIV Monitor")
+st.caption("Supervision d'un système d'information voyageurs embarqué — seuils fixes vs machine learning (Isolation Forest)")
 
-st.subheader("Évolution de la température")
+with st.sidebar:
+    st.header("Scénario")
+    seed = st.number_input("Graine aléatoire", 0, 10_000, 7)
+    days = st.slider("Durée simulée (jours)", 1, 7, 3)
+    rate = st.slider("Incidents par jour", 2, 25, 12)
+    st.divider()
+    st.markdown(
+        "Le modèle est entraîné **sans étiquettes** sur une semaine d'historique, "
+        "puis appliqué au scénario. Les incidents injectés servent uniquement à mesurer les performances."
+    )
 
-# Graphique de température
-fig, ax = plt.subplots()
-ax.plot(df["temperature"], label="Température mesurée")
-ax.axhline(75, linestyle="--", color="red", label="Seuil critique 75°C")
-ax.set_xlabel("Test")
-ax.set_ylabel("Température (°C)")
-ax.set_title("Température du système embarqué")
-ax.legend()
-ax.grid(True, alpha=0.3)
-st.pyplot(fig)
+df = scenario(seed, days, rate).copy()
+ml = trained_detector(1000)
+df["alerte_seuils"] = RuleDetector().predict(df)
+df["score_ml"] = ml.score(df)
+df["alerte_ml"] = ml.predict(df)
+res_rules = evaluate(df, df["alerte_seuils"].to_numpy())
+res_ml = evaluate(df, df["alerte_ml"].to_numpy())
 
-# Graphique de répartition
-status_counts = df["statut"].value_counts()
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Incidents simulés", res_ml["incidents"])
+c2.metric("Détectés par le ML", f"{100 * res_ml['taux_detection']:.0f} %",
+          f"{100 * (res_ml['taux_detection'] - res_rules['taux_detection']):+.0f} pts vs seuils")
+c3.metric("Fausses alertes ML", res_ml["fausses_alertes"],
+          f"{res_ml['fausses_alertes'] - res_rules['fausses_alertes']:+d} vs seuils", delta_color="inverse")
+c4.metric("F1-score ML", f"{res_ml['f1']:.2f}", f"{res_ml['f1'] - res_rules['f1']:+.2f} vs seuils")
 
-fig2, ax2 = plt.subplots()
-colors = ["green" if status == "OK" else "red" for status in status_counts.index]
-ax2.bar(status_counts.index, status_counts.values, color=colors, alpha=0.7)
-ax2.set_xlabel("Statut")
-ax2.set_ylabel("Nombre")
-ax2.set_title("OK vs Alertes")
-ax2.grid(True, axis="y", alpha=0.3
-ax2.set_ylabel("Nombre")
-ax2.set_title("OK vs Alertes")
-st.pyplot(fig2)
+tab_live, tab_compare, tab_alerts = st.tabs(["📈 Télémétrie", "⚖️ Seuils vs ML", "🚨 Journal des alertes"])
 
-st.divider()
+with tab_live:
+    sensor = st.selectbox("Capteur", SENSORS, format_func=SENSOR_LABELS.get)
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df["timestamp"], y=df[sensor], name=SENSOR_LABELS[sensor], line=dict(width=1)))
+    for start, end, kind in incidents(df):
+        fig.add_vrect(x0=df["timestamp"].iloc[start], x1=df["timestamp"].iloc[end - 1],
+                      fillcolor="red", opacity=0.12, line_width=0)
+    hits = df[df["alerte_ml"] == 1]
+    fig.add_trace(go.Scatter(x=hits["timestamp"], y=hits[sensor], mode="markers", name="Alerte ML",
+                             marker=dict(size=5, color="orange")))
+    fig.update_layout(height=420, margin=dict(l=10, r=10, t=30, b=10), legend=dict(orientation="h"))
+    st.plotly_chart(fig, width="stretch")
+    st.caption("Zones rouges : incidents réels injectés. Points orange : alertes levées par le modèle.")
 
-st.subheader("Derniers logs système")
-st.dataframe(df.tail(15), width='stretch')
+    fig_score = go.Figure()
+    fig_score.add_trace(go.Scatter(x=df["timestamp"], y=df["score_ml"], name="Score d'anomalie", line=dict(width=1)))
+    fig_score.add_hline(y=ml.threshold_, line_dash="dash", line_color="red", annotation_text="seuil")
+    fig_score.update_layout(height=250, margin=dict(l=10, r=10, t=30, b=10), title="Score d'anomalie (Isolation Forest)")
+    st.plotly_chart(fig_score, width="stretch")
 
-st.subheader("Alertes détectées")
-alertes = df[df["statut"] == "ALERTE"]
+with tab_compare:
+    metrics = ["taux_detection", "precision", "rappel", "f1"]
+    names = ["Incidents détectés", "Précision", "Rappel", "F1"]
+    fig_cmp = go.Figure([
+        go.Bar(name="Seuils fixes", x=names, y=[res_rules[m] for m in metrics]),
+        go.Bar(name="Isolation Forest", x=names, y=[res_ml[m] for m in metrics]),
+    ])
+    fig_cmp.update_layout(barmode="group", height=380, yaxis_tickformat=".0%", margin=dict(l=10, r=10, t=30, b=10))
+    st.plotly_chart(fig_cmp, width="stretch")
 
-if alertes.empty:
-    st.success("Aucune alerte détectée.")
-else:
-    st.dataframe(alertes, width='stretch')
+    by_type = pd.DataFrame({
+        "Incident": [INCIDENT_TYPES[k] for k in res_ml["par_type"]],
+        "Seuils fixes": [f"{100 * res_rules['par_type'][k]:.0f} %" for k in res_ml["par_type"]],
+        "Isolation Forest": [f"{100 * v:.0f} %" for v in res_ml["par_type"].values()],
+    })
+    st.subheader("Taux de détection par type d'incident")
+    st.dataframe(by_type, hide_index=True, width="stretch")
 
-st.divider()
-
-st.stry:
-        with open("rapport.txt", "r", encoding="utf-8") as file:
-            st.text(file.read())
-    except Exception as e:
-        st.error(f"Erreur lors de la lecture du rapport : {e}"
-if os.path.exists("rapport.txt"):
-    with open("rapport.txt", "r", encoding="utf-8") as file:
-        st.text(file.read())
-else:
-    st.info("Rapport non généré.")
+with tab_alerts:
+    rules = RuleDetector()
+    alerts = df[(df["alerte_ml"] == 1) | (df["alerte_seuils"] == 1)].copy()
+    alerts["source"] = alerts.apply(
+        lambda r: " + ".join(s for s, flag in [("ML", r["alerte_ml"]), ("Seuils", r["alerte_seuils"])] if flag), axis=1)
+    alerts["motif seuils"] = alerts.apply(lambda r: ", ".join(rules.reasons(r)) or "—", axis=1)
+    alerts["incident réel"] = alerts["incident"].map(lambda k: INCIDENT_TYPES.get(k, "Aucun (fausse alerte)"))
+    alerts[["score_ml", *SENSORS]] = alerts[["score_ml", *SENSORS]].round(2)
+    st.dataframe(
+        alerts[["timestamp", "source", "score_ml", "motif seuils", "incident réel", *SENSORS]],
+        hide_index=True, width="stretch", height=460,
+    )
+    st.download_button("Exporter le journal (CSV)", alerts.to_csv(index=False).encode("utf-8"),
+                       "alertes_siv.csv", "text/csv")
